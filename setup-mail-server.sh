@@ -5,14 +5,23 @@ log() {
     echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] $@"
 }
 
-# Функция для отката изменений
-rollback() {
-    log "Ошибка! Восстановление исходных файлов..."
-    sudo cp -f "/etc/postfix/main.cf.bak" "/etc/postfix/main.cf"
-    sudo cp -f "/etc/dovecot/conf.d/10-mail.conf.bak" "/etc/dovecot/conf.d/10-mail.conf"
-    sudo rm -f "/etc/dovecot/dovecot-users"
-    sudo rm -rf "/etc/opendkim/keys/$DOMAIN"
-    log "Исходные файлы восстановлены."
+# Функция для отката изменений для одного домена
+rollback_domain() {
+    local domain="$1"
+    log "Ошибка! Восстановление исходных файлов для домена $domain..."
+    sudo cp -f "/etc/postfix/main.cf.bak.$domain" "/etc/postfix/main.cf"
+    sudo cp -f "/etc/dovecot/conf.d/10-mail.conf.bak.$domain" "/etc/dovecot/conf.d/10-mail.conf"
+    sudo rm -f "/etc/dovecot/dovecot-users.$domain"
+    sudo rm -rf "/etc/opendkim/keys/$domain"
+    log "Исходные файлы восстановлены для домена $domain."
+}
+
+# Функция для отката изменений для всех доменов при ошибке
+rollback_all_domains() {
+    log "Произошла ошибка! Откат изменений для всех доменов..."
+    for DOMAIN in "${DOMAINS[@]}"; do
+        rollback_domain "$DOMAIN"
+    done
     exit 1
 }
 
@@ -22,173 +31,149 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# Запрос домена
-read -p "Введите ваш домен (например, example.com): " DOMAIN
-EMAIL="admin@$DOMAIN"
+# Запрос списка доменов
+read -p "Введите список доменов (разделенных пробелами): " DOMAINS
+DOMAINS=($DOMAINS)
 
-# Запрос пароля
-read -sp "Введите ваш пароль: " PASSWORD
-echo
+# Обработка ошибок и откат изменений при ошибке для всех доменов
+trap 'rollback_all_domains' ERR
 
-# Пути к резервным копиям файлов конфигурации
-POSTFIX_MAIN_CF_BAK="/etc/postfix/main.cf.bak"
-DOVECOT_10_MAIL_CONF_BAK="/etc/dovecot/conf.d/10-mail.conf.bak"
+# Установка необходимых компонентов
+log "Установка необходимых компонентов..."
+sudo apt update
 
-# Создание резервных копий файлов конфигурации
-if [ -f "$POSTFIX_MAIN_CF_BAK" ] || [ -f "$DOVECOT_10_MAIL_CONF_BAK" ]; then
-    log "Резервные копии файлов конфигурации уже существуют. Продолжаем..."
-else
-    sudo cp -f "/etc/postfix/main.cf" "$POSTFIX_MAIN_CF_BAK"
-    sudo cp -f "/etc/dovecot/conf.d/10-mail.conf" "$DOVECOT_10_MAIL_CONF_BAK"
-    log "Созданы резервные копии файлов конфигурации."
-fi
+# Установка компонентов, если их нет
+for pkg in apache2 postfix dovecot-core dovecot-imapd dovecot-pop3d opendkim-tools roundcube roundcube-mysql certbot; do
+    if ! dpkg -l | grep -q $pkg; then
+        sudo apt install -y $pkg
+    fi
+done
 
-# Обработка ошибок и откат изменений при ошибке
-trap 'rollback' ERR
+# Цикл по всем доменам
+for DOMAIN in "${DOMAINS[@]}"; do
+    EMAIL="admin@$DOMAIN"
+    WEBMAIL_SUBDOMAIN="webmail.$DOMAIN"
 
-# Обновление и установка необходимых пакетов
-log "Обновление системы и установка необходимых пакетов..."
-if ! sudo apt update || ! sudo apt install -y postfix dovecot-core dovecot-imapd opendkim opendkim-tools certbot apache2 php libapache2-mod-php; then
-    log "Ошибка при установке пакетов. Проверьте наличие интернет-соединения и попробуйте еще раз."
-    exit 1
-fi
+    # Генерация DKIM записи
+    DKIM_RECORD=$(sudo opendkim-genkey -b 2048 -t -D "/etc/opendkim/keys/$DOMAIN" -d "$DOMAIN" -s mail | grep -o -P '(?<=p=).*(?=")')
 
-# Конфигурация Postfix
-log "Настройка Postfix..."
-if ! sudo postconf -e "myhostname = $DOMAIN" ||
-   ! sudo postconf -e "mydestination = $DOMAIN, localhost.localdomain, localhost" ||
-   ! sudo postconf -e "mynetworks = 127.0.0.0/8, [::1]/128" ||
-   ! sudo postconf -e "inet_interfaces = all"; then
-    log "Ошибка при настройке Postfix."
-    exit 1
-fi
+    # Пути к резервным копиям файлов конфигурации
+    POSTFIX_MAIN_CF_BAK="/etc/postfix/main.cf.bak.$DOMAIN"
+    DOVECOT_10_MAIL_CONF_BAK="/etc/dovecot/conf.d/10-mail.conf.bak.$DOMAIN"
 
-# Конфигурация Dovecot
-log "Настройка Dovecot..."
-DOVECOT_CONF="/etc/dovecot/conf.d/10-mail.conf"
-if ! echo "mail_location = mbox:~/mail:INBOX=/var/mail/%u" | sudo tee -a "$DOVECOT_CONF"; then
-    log "Ошибка при настройке Dovecot."
-    exit 1
-fi
+    # Создание резервных копий файлов конфигурации
+    if [ -f "$POSTFIX_MAIN_CF_BAK" ] || [ -f "$DOVECOT_10_MAIL_CONF_BAK" ]; then
+        log "Резервные копии файлов конфигурации для домена $DOMAIN уже существуют. Продолжаем..."
+    else
+        sudo cp -f "/etc/postfix/main.cf" "$POSTFIX_MAIN_CF_BAK"
+        sudo cp -f "/etc/dovecot/conf.d/10-mail.conf" "$DOVECOT_10_MAIL_CONF_BAK"
+        log "Созданы резервные копии файлов конфигурации для домена $DOMAIN."
+    fi
 
-# Создание пользователя и пароля для Dovecot
-log "Настройка аутентификации Dovecot..."
-ENCRYPTED_PASS=$(doveadm pw -s SHA512-CRYPT -p "$PASSWORD")
-if ! echo "$EMAIL:$ENCRYPTED_PASS" | sudo tee "/etc/dovecot/dovecot-users"; then
-    log "Ошибка при создании пользователя Dovecot."
-    exit 1
-fi
+    # Дополнительная настройка Postfix, Dovecot, OpenDKIM и других параметров для каждого домена
 
-# Создание и настройка ключей DKIM
-log "Настройка DKIM..."
-DKIM_KEY_DIR="/etc/opendkim/keys/$DOMAIN"
-if [ -d "$DKIM_KEY_DIR" ]; then
-    log "Ключи DKIM уже существуют. Продолжаем..."
-else
-    sudo mkdir -p "$DKIM_KEY_DIR" &&
-    sudo opendkim-genkey -b 2048 -D "$DKIM_KEY_DIR" -d "$DOMAIN" -s mail &&
-    sudo chown opendkim:opendkim "$DKIM_KEY_DIR"/* &&
-    sudo chmod 600 "$DKIM_KEY_DIR"/*
-    log "Созданы и настроены ключи DKIM."
-fi
+    # Конфигурация Postfix
+    log "Настройка Postfix для домена $DOMAIN..."
+    cat <<EOL | sudo tee "/etc/postfix/main.cf.$DOMAIN"
+myhostname = $DOMAIN
+mydestination = $DOMAIN, localhost.localdomain, localhost
+mynetworks = 127.0.0.0/8, [::1]/128
+inet_interfaces = all
+smtpd_tls_cert_file = /etc/letsencrypt/live/$DOMAIN/fullchain.pem
+smtpd_tls_key_file = /etc/letsencrypt/live/$DOMAIN/privkey.pem
+smtpd_use_tls = yes
+EOL
 
-# Настройка OpenDKIM
-OPENDKIM_CONF="/etc/opendkim.conf"
-if ! echo "Domain                  $DOMAIN" | sudo tee -a "$OPENDKIM_CONF" ||
-   ! echo "KeyFile                 /etc/opendkim/keys/$DOMAIN/mail.private" | sudo tee -a "$OPENDKIM_CONF" ||
-   ! echo "Selector                mail" | sudo tee -a "$OPENDKIM_CONF"; then
-    log "Ошибка при настройке OpenDKIM."
-    exit 1
-fi
+    # Создание файла для мэппинга отправителей
+    sudo mkdir -p "/etc/postfix/generic"
+    echo "@$DOMAIN   $EMAIL" | sudo tee "/etc/postfix/generic/$DOMAIN"
+    sudo postmap "/etc/postfix/generic/$DOMAIN"
 
-# Интеграция OpenDKIM с Postfix
-log "Интеграция OpenDKIM с Postfix..."
-if ! sudo postconf -e "milter_default_action = accept" ||
-   ! sudo postconf -e "milter_protocol = 2" ||
-   ! sudo postconf -e "smtpd_milters = inet:localhost:12301" ||
-   ! sudo postconf -e "non_smtpd_milters = inet:localhost:12301"; then
-    log "Ошибка при интеграции OpenDKIM с Postfix."
-    exit 1
-fi
+    # Конфигурация Dovecot
+    log "Настройка Dovecot для домена $DOMAIN..."
+    cat <<EOL | sudo tee "/etc/dovecot/conf.d/10-mail.conf.$DOMAIN"
+mail_location = mbox:~/mail:INBOX=/var/mail/%u
+ssl_cert = </etc/letsencrypt/live/$DOMAIN/fullchain.pem
+ssl_key = </etc/letsencrypt/live/$DOMAIN/privkey.pem
+EOL
 
-# Получение SSL сертификата Let's Encrypt
-log "Получение сертификата Let's Encrypt..."
-if ! sudo certbot certonly --standalone --preferred-challenges http -d "$DOMAIN" --agree-tos --non-interactive --email "$EMAIL"; then
-    log "Ошибка при получении сертификата Let's Encrypt."
-    exit 1
-fi
+    # Создание пользователя и пароля для Dovecot
+    log "Настройка аутентификации Dovecot для домена $DOMAIN..."
+    PASSWORD=$(openssl rand -base64 12)
+    ENCRYPTED_PASS=$(doveadm pw -s SHA512-CRYPT -p "$PASSWORD")
+    echo "$EMAIL:$ENCRYPTED_PASS" | sudo tee "/etc/dovecot/dovecot-users.$DOMAIN"
 
-# Настройка SSL для Postfix и Dovecot
-log "Настройка SSL для Postfix и Dovecot..."
-if ! sudo postconf -e "smtpd_tls_cert_file = /etc/letsencrypt/live/$DOMAIN/fullchain.pem" ||
-   ! sudo postconf -e "smtpd_tls_key_file = /etc/letsencrypt/live/$DOMAIN/privkey.pem" ||
-   ! sudo postconf -e "smtpd_use_tls = yes"; then
-    log "Ошибка при настройке SSL для Postfix и Dovecot."
-    exit 1
-fi
+    # Создание и настройка ключей DKIM
+    log "Настройка DKIM для домена $DOMAIN..."
+    DKIM_KEY_DIR="/etc/opendkim/keys/$DOMAIN"
+    if [ ! -d "$DKIM_KEY_DIR" ]; then
+        sudo mkdir -p "$DKIM_KEY_DIR"
+        sudo opendkim-genkey -b 2048 -D "$DKIM_KEY_DIR" -d "$DOMAIN" -s mail
+        sudo chown opendkim:opendkim "$DKIM_KEY_DIR"/*
+        sudo chmod 600 "$DKIM_KEY_DIR"/*
+        log "Созданы и настроены ключи DKIM для домена $DOMAIN."
+    fi
 
-# Установка и настройка Roundcube
-log "Установка и настройка Roundcube..."
-if ! sudo apt install -y roundcube roundcube-mysql ||
-   ! sudo ln -s /etc/roundcube/apache.conf /etc/apache2/conf-available/roundcube.conf ||
-   ! sudo a2enconf roundcube ||
-   ! sudo service apache2 reload; then
-    log "Ошибка при установке и настройке Roundcube."
-    exit 1
-fi
+    # Настройка OpenDKIM
+    log "Настройка OpenDKIM для домена $DOMAIN..."
+    cat <<EOL | sudo tee "/etc/opendkim.conf.$DOMAIN"
+Domain                  $DOMAIN
+KeyFile                 /etc/opendkim/keys/$DOMAIN/mail.private
+Selector                mail
+EOL
 
-if ! echo "ssl_cert = </etc/letsencrypt/live/$DOMAIN/fullchain.pem" | sudo tee -a "$DOVECOT_CONF" ||
-   ! echo "ssl_key = </etc/letsencrypt/live/$DOMAIN/privkey.pem" | sudo tee -a "$DOVECOT_CONF"; then
-    log "Ошибка при настройке SSL для Dovecot."
-    exit 1
-fi
+    # Интеграция OpenDKIM с Postfix
+    log "Интеграция OpenDKIM с Postfix для домена $DOMAIN..."
+    sudo postconf -e "milter_default_action = accept"
+    sudo postconf -e "milter_protocol = 2"
+    sudo postconf -e "smtpd_milters = inet:localhost:12301"
+    sudo postconf -e "non_smtpd_milters = inet:localhost:12301"
 
-# Перезапуск служб
-log "Перезапуск служб..."
-if ! sudo systemctl restart postfix ||
-   ! sudo systemctl restart dovecot ||
-   ! sudo systemctl restart opendkim; then
-    log "Ошибка при перезапуске служб."
-    exit 1
-fi
+    # Получение SSL сертификата Let's Encrypt
+    log "Получение сертификата Let's Encrypt для домена $DOMAIN..."
+    sudo certbot certonly --standalone --preferred-challenges http -d "$DOMAIN" --agree-tos --non-interactive --email "$EMAIL"
+
+    # Создание виртуального хоста для поддомена webmail
+    log "Создание виртуального хоста для поддомена $WEBMAIL_SUBDOMAIN..."
+    cat <<EOL | sudo tee "/etc/apache2/sites-available/$WEBMAIL_SUBDOMAIN.conf"
+<VirtualHost *:80>
+    ServerAdmin webmaster@$DOMAIN
+    ServerName $WEBMAIL_SUBDOMAIN
+    DocumentRoot /var/www/webmail
+
+    ErrorLog ${APACHE_LOG_DIR}/error.log
+    CustomLog ${APACHE_LOG_DIR}/access.log combined
+</VirtualHost>
+EOL
+
+    # Создание страницы приветствия на основном домене с ссылкой на веб-панель почты
+    log "Создание страницы приветствия на основном домене $DOMAIN..."
+    cat <<EOL | sudo tee "/var/www/html/index.html"
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Добро пожаловать на $DOMAIN</title>
+</head>
+<body>
+    <h1>Добро пожаловать на $DOMAIN</h1>
+    <p>Вы можете перейти к веб-панели почты по ссылке:</p>
+    <a href="http://$WEBMAIL_SUBDOMAIN">Веб-панель почты</a>
+</body>
+</html>
+EOL
+
+    # Активация виртуального хоста для поддомена и перезагрузка Apache
+    sudo a2ensite "$WEBMAIL_SUBDOMAIN.conf"
+    sudo service apache2 reload
+
+    # Вывод информации о доступе к веб-панели почты
+    log "Доступ к веб-панели почты (Roundcube) для домена $DOMAIN:"
+    echo "--------------------------------"
+    echo "|          URL           |"
+    echo "--------------------------------"
+    echo "| http://$WEBMAIL_SUBDOMAIN |"
+    echo "--------------------------------"
+done
 
 # Очистка ловушки
 trap - ERR
-
-# Вывод информации
-log "Информация для DNS-настройки:"
-echo "--------------------------------------------------"
-echo "|      Тип записи      |               Значение              |"
-echo "--------------------------------------------------"
-echo "|        DKIM           | mail._domainkey IN TXT \"v=DKIM1; k=rsa; p=$DKIM_RECORD\" |"
-echo "--------------------------------------------------"
-echo "|         SPF           |       @ IN TXT \"v=spf1 mx -all\"     |"
-echo "--------------------------------------------------"
-echo ""
-log "Используйте следующие порты для подключения:"
-echo "--------------------------------"
-echo "| Порт |     Протокол     |"
-echo "--------------------------------"
-echo "|  143 | IMAP (без SSL)   |"
-echo "--------------------------------"
-echo "|  993 |   IMAP (с SSL)   |"
-echo "--------------------------------"
-echo "|   25 | SMTP (без SSL)   |"
-echo "--------------------------------"
-echo "|  587 | SMTP (с SSL/TLS) |"
-echo "--------------------------------"
-echo ""
-log "Информация для входа:"
-echo "----------------------------------"
-echo "|    Логин    |    Пароль    |"
-echo "----------------------------------"
-echo "| $EMAIL | $PASSWORD |"
-echo "----------------------------------"
-
-# Вывод информации о веб-интерфейсе
-log "Доступ к веб-панели почты (Roundcube):"
-echo "--------------------------------"
-echo "|          URL           |"
-echo "--------------------------------"
-echo "| http://$DOMAIN/roundcube |"
-echo "--------------------------------"
