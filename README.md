@@ -35,12 +35,12 @@
 
 ```bash
 git clone https://github.com/xoxma1993/auto-install-Postfix-Dovecot-OpenDKIM-Certbot.git
+cd auto-install-Postfix-Dovecot-OpenDKIM-Certbot
 ```
 
 ### Шаг 3: Выставление прав
 
 ```bash
-cd auto-install-Postfix-Dovecot-OpenDKIM-Certbot
 chmod +x setup-mail-server.sh
 ```
 
