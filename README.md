@@ -37,8 +37,7 @@ apt install git && apt install sudo
 Склонируйте репозиторий с помощью следующей команды:
 
 ```bash
-git clone https://github.com/xoxma1993/auto-install-Postfix-Dovecot-OpenDKIM-Certbot.git
-cd auto-install-Postfix-Dovecot-OpenDKIM-Certbot
+git clone https://github.com/xoxma1993/auto-install-Postfix-Dovecot-OpenDKIM-Certbot.git && cd auto-install-Postfix-Dovecot-OpenDKIM-Certbot
 ```
 
 ### Шаг 3: Выставление прав

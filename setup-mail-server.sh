@@ -52,6 +52,16 @@ fi
 log "Установка необходимых компонентов..."
 sudo apt update
 
+# Установка MariaDB Server и phpMyAdmin
+if ! dpkg -l | grep -q mariadb-server; then
+    sudo apt install -y mariadb-server
+fi
+
+if ! dpkg -l | grep -q phpmyadmin; then
+    sudo apt install -y phpmyadmin
+fi
+
+# Установка остальных компонентов
 for pkg in apache2 postfix dovecot-core dovecot-imapd dovecot-pop3d opendkim-tools roundcube roundcube-mysql certbot; do
     if ! dpkg -l | grep -q $pkg; then
         sudo apt install -y $pkg
