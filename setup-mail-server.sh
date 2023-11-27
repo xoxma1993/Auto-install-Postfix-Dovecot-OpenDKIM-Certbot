@@ -100,3 +100,4 @@ echo "SMTP (с SSL/TLS): 587 (или 465)"
 log "Информация для входа:"
 echo "Логин: $EMAIL"
 echo "Пароль: $PASSWORD"
+ 
